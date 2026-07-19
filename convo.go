@@ -158,8 +158,8 @@ func toolLine(b map[string]any) string {
 		return "Read " + str(input["file_path"])
 	case "WebFetch":
 		return "WebFetch " + str(input["url"])
-	case "Task":
-		return "Task → " + oneLine(str(input["description"]))
+	case "Task", "Agent":
+		return name + " → " + oneLine(str(input["description"]))
 	case "":
 		return ""
 	default:

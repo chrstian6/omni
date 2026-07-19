@@ -167,6 +167,12 @@ func str(v any) string {
 	return s
 }
 
+// truthy reads a JSON boolean out of an untyped value (missing/other → false).
+func truthy(v any) bool {
+	b, _ := v.(bool)
+	return b
+}
+
 func orDefault(s, def string) string {
 	if s == "" {
 		return def

@@ -119,14 +119,27 @@ func loadSubagents(sessionID string) []Subagent {
 		for _, b := range msg.Content {
 			switch b["type"] {
 			case "tool_use":
-				if str(b["name"]) != "Task" {
+				// Subagents are launched via either the classic "Task" tool or the
+				// newer "Agent" tool — both start a subagent and are closed by their
+				// matching tool_result. A launch with no result yet is still running:
+				// that's the live fan-out we want to surface.
+				name := str(b["name"])
+				if name != "Task" && name != "Agent" {
+					continue
+				}
+				input, _ := b["input"].(map[string]any)
+				// Background Agent launches return an immediate ack and finish
+				// asynchronously, reported later via <task-notification> (handled by
+				// noteAgents, which has their real duration and token totals). Skip
+				// them here so they aren't marked "finished" at ack time or counted
+				// twice.
+				if name == "Agent" && truthy(input["run_in_background"]) {
 					continue
 				}
 				id := str(b["id"])
 				if id == "" {
 					continue
 				}
-				input, _ := b["input"].(map[string]any)
 				a := &Subagent{
 					ID:      id,
 					Name:    subagentName(input),
