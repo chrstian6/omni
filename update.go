@@ -21,6 +21,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Keep the heartbeat fresh so hooks know a dashboard is here, and refresh
 		// the fast-moving data (sessions + pending permission requests).
 		touchHeartbeat()
+		// Re-read the approve-all policy from disk so the Permissions sidebar tracks
+		// the persisted truth: a session whose auto-approve was turned off (here, by
+		// the hook, or by another instance) drops out within a tick instead of
+		// lingering as a stale row. policy.json is tiny, so the sync read is cheap.
+		m.policy = loadPolicy()
+		if n := len(m.permItems()); m.permCursor >= n {
+			m.permCursor = max(0, n-1)
+		}
 		cmds := []tea.Cmd{loadSessionsCmd(), loadPendingCmd(), tickCmd()}
 		// Live view: while a session is open on the Sessions tab, re-read its
 		// activity and conversation each tick so you watch it happen in real
