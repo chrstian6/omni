@@ -1,0 +1,9 @@
+# Built binaries / bundles
+/omni
+/claude-deck
+/dist/
+/Omni.app/
+.build/
+
+# macOS
+.DS_Store
