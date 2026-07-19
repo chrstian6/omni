@@ -354,6 +354,17 @@ func (m Model) keySessions(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.follow = true
 			return m, nil
 		}
+	case "i":
+		// Interrupt the live session's in-progress turn — the equivalent of pressing
+		// Esc/Ctrl-C in the session itself. Only meaningful while it's working.
+		if r, ok := m.selectedRow(); ok && r.live {
+			if !r.s.IsBusy() {
+				m.setStatus("nothing running to interrupt", false)
+				return m, nil
+			}
+			m.setStatus("interrupting "+m.cfg.DisplayName(r.s)+"…", false)
+			return m, interruptCmd(r.s)
+		}
 	case "p":
 		if _, ok := m.selectedRow(); ok {
 			// No busy-guard: a prompt sent to a working session is queued by Claude
@@ -620,6 +631,12 @@ func (m Model) keyObserve(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.textarea.Reset()
 			return m, m.textarea.Focus()
 		}
+	case "i":
+		// Interrupt the watched session's current turn without leaving observe mode.
+		if r, ok := m.selectedRow(); ok && r.live && r.s.IsBusy() {
+			return m, interruptCmd(r.s)
+		}
+		return m, nil
 	case "up", "k":
 		return m.scrollMain(-1), nil
 	case "down", "j":
@@ -672,6 +689,17 @@ func (m Model) keyConfirmEnd(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.mode = modeList
 	}
 	return m, nil
+}
+
+// interruptCmd sends an interrupt (SIGINT) to a live session so it cancels its
+// current turn, the same as pressing Esc/Ctrl-C in the session itself.
+func interruptCmd(s Session) tea.Cmd {
+	return func() tea.Msg {
+		if err := interruptProcess(s.PID); err != nil {
+			return actionDoneMsg{"couldn't interrupt " + s.Name + ": " + err.Error(), true}
+		}
+		return actionDoneMsg{"sent interrupt to " + s.Name, false}
+	}
 }
 
 // --- Permissions tab ---
