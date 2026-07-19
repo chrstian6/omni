@@ -41,23 +41,21 @@ func (a Subagent) Elapsed() time.Duration {
 	return end.Sub(a.Started)
 }
 
-// txRec is the slice of a transcript record we need for token attribution.
-type txRec struct {
-	uuid   string
-	parent string
-	side   bool // isSidechain
-	tokens int  // message.usage.output_tokens
-}
-
-// loadSubagents walks the transcript once, pairing Task launches with their
-// results and attributing sidechain output-tokens back to each Task.
+// loadSubagents walks the transcript once and reconstructs every subagent this
+// session launched, tracking whether each is still running.
 //
-// Token attribution: a subagent's work is logged as `isSidechain` records whose
-// parent chain leads back to the assistant message that spawned the Task. We sum
-// each sidechain record's output_tokens onto that spawning message, then split it
-// across the Tasks launched in that message. For a lone Task the number is exact;
-// for several launched together (the parallel case) it's an even split — the per-
-// agent figure is approximate but the totals are right.
+// There are two launch shapes to reconcile, keyed by tool_use id:
+//   - Sync (foreground): an Agent/Task tool_use, closed by a tool_result whose
+//     content is the agent's actual report — that result is the finish.
+//   - Async (background): an Agent tool_use whose tool_result is only a launch
+//     ACK ("Async agent launched…"). The agent is NOT finished then — it's now
+//     running in the background, and its real completion arrives later as a
+//     <task-notification> carrying the same <tool-use-id>, plus the true
+//     duration and token totals. Marking it finished at ack time was the bug
+//     that made a just-started agent show as done.
+//
+// Notifications are matched back to their launch by tool-use-id, so an async
+// agent is one row that goes running → finished — never a duplicate.
 func loadSubagents(sessionID string) []Subagent {
 	path := findTranscript(sessionID)
 	if path == "" {
@@ -69,14 +67,19 @@ func loadSubagents(sessionID string) []Subagent {
 	}
 	defer f.Close()
 
-	// order preserves launch order; byID lets the result records find their agent.
-	var order []string
-	byID := map[string]*Subagent{}
+	var order []string             // launch order, by tool_use id
+	byID := map[string]*Subagent{} // tool_use id -> agent
 
-	recs := map[string]txRec{}       // uuid -> record, for parent walking
-	var sideRecs []txRec             // sidechain records that produced tokens
-	taskSpawn := map[string]string{} // taskID -> spawning assistant uuid
-	tasksPerUUID := map[string]int{} // assistant uuid -> number of Tasks in it
+	// Latest task-notification per tool-use-id (a task may notify more than once).
+	type notif struct {
+		ts     time.Time
+		status string
+		dur    time.Duration
+		tokens int
+		name   string
+	}
+	notifs := map[string]notif{}
+	var notifOrder []string
 
 	scanner := bufio.NewScanner(f)
 	scanner.Buffer(make([]byte, 0, 64*1024), 32*1024*1024)
@@ -86,102 +89,127 @@ func loadSubagents(sessionID string) []Subagent {
 			continue
 		}
 		var rec struct {
-			Type        string          `json:"type"`
-			UUID        string          `json:"uuid"`
-			ParentUUID  string          `json:"parentUuid"`
-			IsSidechain bool            `json:"isSidechain"`
-			Timestamp   string          `json:"timestamp"`
-			Message     json.RawMessage `json:"message"`
+			Type      string          `json:"type"`
+			Timestamp string          `json:"timestamp"`
+			Message   json.RawMessage `json:"message"`
 		}
 		if err := json.Unmarshal([]byte(line), &rec); err != nil {
 			continue
 		}
-		var msg struct {
-			Content []map[string]any `json:"content"`
-			Usage   struct {
-				OutputTokens int `json:"output_tokens"`
-			} `json:"usage"`
-		}
-		_ = json.Unmarshal(rec.Message, &msg) // content may be a bare string — ignore
-
-		rc := txRec{uuid: rec.UUID, parent: rec.ParentUUID, side: rec.IsSidechain, tokens: msg.Usage.OutputTokens}
-		if rec.UUID != "" {
-			recs[rec.UUID] = rc
-		}
-		if rec.IsSidechain && msg.Usage.OutputTokens > 0 {
-			sideRecs = append(sideRecs, rc)
-		}
-
 		if rec.Type != "assistant" && rec.Type != "user" {
 			continue
 		}
 		ts := parseTS(rec.Timestamp)
+
+		// A task-notification is an async agent reporting in — record it against
+		// its tool-use-id (falling back to task-id for older shapes) and move on.
+		if strings.Contains(line, "task-notification") {
+			text := messageText(rec.Message)
+			key := firstGroup(reNAToolUse, text)
+			if key == "" {
+				key = firstGroup(reNATaskID, text)
+			}
+			if key != "" {
+				n := notif{ts: ts, status: firstGroup(reNAStatus, text)}
+				if d := firstGroup(reNADur, text); d != "" {
+					if ms, e := strconv.Atoi(d); e == nil {
+						n.dur = time.Duration(ms) * time.Millisecond
+					}
+				}
+				if t := firstGroup(reNATokens, text); t != "" {
+					n.tokens, _ = strconv.Atoi(t)
+				}
+				n.name = firstGroup(reNAName, firstGroup(reNASummary, text))
+				if _, seen := notifs[key]; !seen {
+					notifOrder = append(notifOrder, key)
+				}
+				notifs[key] = n
+			}
+			continue
+		}
+
+		var msg struct {
+			Content []map[string]any `json:"content"`
+		}
+		_ = json.Unmarshal(rec.Message, &msg) // content may be a bare string — ignore
 		for _, b := range msg.Content {
 			switch b["type"] {
 			case "tool_use":
-				// Subagents are launched via either the classic "Task" tool or the
-				// newer "Agent" tool — both start a subagent and are closed by their
-				// matching tool_result. A launch with no result yet is still running:
-				// that's the live fan-out we want to surface.
+				// Subagents launch via either the classic "Task" tool or the newer
+				// "Agent" tool. A launch with no finishing result is still running —
+				// the live fan-out we want to surface.
 				name := str(b["name"])
 				if name != "Task" && name != "Agent" {
-					continue
-				}
-				input, _ := b["input"].(map[string]any)
-				// Background Agent launches return an immediate ack and finish
-				// asynchronously, reported later via <task-notification> (handled by
-				// noteAgents, which has their real duration and token totals). Skip
-				// them here so they aren't marked "finished" at ack time or counted
-				// twice.
-				if name == "Agent" && truthy(input["run_in_background"]) {
 					continue
 				}
 				id := str(b["id"])
 				if id == "" {
 					continue
 				}
-				a := &Subagent{
+				input, _ := b["input"].(map[string]any)
+				if _, seen := byID[id]; !seen {
+					order = append(order, id)
+				}
+				byID[id] = &Subagent{
 					ID:      id,
 					Name:    subagentName(input),
 					Type:    str(input["subagent_type"]),
 					Started: ts,
 					Running: true,
 				}
-				if _, seen := byID[id]; !seen {
-					order = append(order, id)
-					tasksPerUUID[rec.UUID]++
-					taskSpawn[id] = rec.UUID
-				}
-				byID[id] = a
 			case "tool_result":
-				id := str(b["tool_use_id"])
-				if a, ok := byID[id]; ok {
-					a.Ended = ts
-					a.Running = false
+				a, ok := byID[str(b["tool_use_id"])]
+				if !ok {
+					continue
 				}
+				// An async-launch ACK means the agent is now working in the
+				// background — leave it running; its completion comes via a
+				// task-notification. A normal (sync) result is the finish.
+				if isAsyncLaunchAck(toolResultText(b)) {
+					continue
+				}
+				a.Ended = ts
+				a.Running = false
 			}
 		}
 	}
 
-	// Fold each sidechain record's tokens onto the message that spawned its Task.
-	tokensBySpawn := map[string]int{}
-	for _, sr := range sideRecs {
-		tokensBySpawn[spawnUUID(sr, recs)] += sr.tokens
-	}
-	for id, a := range byID {
-		if u := taskSpawn[id]; u != "" && tasksPerUUID[u] > 0 {
-			a.Tokens = tokensBySpawn[u] / tasksPerUUID[u]
+	// Reconcile notifications with their launches (matched by tool-use-id). When
+	// we never saw the launch (a truncated transcript), synthesize the agent from
+	// the notification alone so it still shows.
+	for _, key := range notifOrder {
+		n := notifs[key]
+		terminal := n.status == "" || n.status == "completed" || n.status == "failed"
+		if a, ok := byID[key]; ok {
+			if n.tokens > 0 {
+				a.Tokens = n.tokens
+			}
+			if n.name != "" {
+				a.Name = n.name
+			}
+			if terminal {
+				a.Running = false
+				if n.ts.After(a.Started) {
+					a.Ended = n.ts
+				}
+			} else {
+				a.Running = true // notified but resumable — still in flight
+			}
+			continue
 		}
+		if n.name == "" {
+			continue // not a genuine agent-completion notification
+		}
+		byID[key] = &Subagent{ID: key, Name: n.name, Started: n.ts.Add(-n.dur), Ended: n.ts, Running: !terminal, Tokens: n.tokens}
+		order = append(order, key)
 	}
 
 	out := make([]Subagent, 0, len(order))
 	for _, id := range order {
-		out = append(out, *byID[id])
+		if a := byID[id]; a != nil {
+			out = append(out, *a)
+		}
 	}
-	// Most sessions here don't use the classic Task tool_use — their background
-	// agents show up only as <task-notification> messages. Fold those in too.
-	out = append(out, noteAgents(path)...)
-
 	// Running agents first, then most-recently-started first.
 	sort.SliceStable(out, func(i, j int) bool {
 		if out[i].Running != out[j].Running {
@@ -194,82 +222,38 @@ func loadSubagents(sessionID string) []Subagent {
 
 var (
 	reNATaskID  = regexp.MustCompile(`<task-id>([^<]+)</task-id>`)
+	reNAToolUse = regexp.MustCompile(`<tool-use-id>([^<]+)</tool-use-id>`)
+	reNAStatus  = regexp.MustCompile(`<status>([^<]+)</status>`)
 	reNASummary = regexp.MustCompile(`(?s)<summary>(.*?)</summary>`)
 	reNATokens  = regexp.MustCompile(`<subagent_tokens>(\d+)</subagent_tokens>`)
 	reNADur     = regexp.MustCompile(`<duration_ms>(\d+)</duration_ms>`)
 	reNAName    = regexp.MustCompile(`Agent\s+"([^"]+)"`)
 )
 
-// noteAgents reconstructs background agents from <task-notification> messages —
-// the way agents are recorded when they're launched outside the classic Task
-// tool (content is a bare string carrying summary/usage XML). Each notification
-// is a finished agent; the record timestamp is its finish time and duration_ms
-// how long it ran, so Started = finish − duration. Deduped by task-id (a task can
-// notify more than once — the latest wins).
-func noteAgents(path string) []Subagent {
-	f, err := os.Open(path)
-	if err != nil {
-		return nil
-	}
-	defer f.Close()
+// isAsyncLaunchAck recognizes the internal tool_result the harness returns when
+// an Agent is launched in the background — it means "started", not "finished".
+func isAsyncLaunchAck(s string) bool {
+	return strings.Contains(s, "Async agent launched") ||
+		strings.Contains(s, "working in the background")
+}
 
-	byTask := map[string]*Subagent{}
-	var order []string
-	sc := bufio.NewScanner(f)
-	sc.Buffer(make([]byte, 0, 64*1024), 32*1024*1024)
-	for sc.Scan() {
-		line := strings.TrimSpace(sc.Text())
-		if line == "" || !strings.Contains(line, "task-notification") {
-			continue
-		}
-		var rec struct {
-			Type      string          `json:"type"`
-			Timestamp string          `json:"timestamp"`
-			Message   json.RawMessage `json:"message"`
-		}
-		if json.Unmarshal([]byte(line), &rec) != nil {
-			continue
-		}
-		if rec.Type != "user" && rec.Type != "assistant" {
-			continue
-		}
-		text := messageText(rec.Message)
-		if !strings.Contains(text, "<task-notification>") {
-			continue
-		}
-		id := firstGroup(reNATaskID, text)
-		if id == "" {
-			continue
-		}
-		// Only genuine agent-completion notifications name an agent as
-		// Agent "X". Others (e.g. orphaned-agent warnings) are skipped.
-		name := firstGroup(reNAName, firstGroup(reNASummary, text))
-		if name == "" {
-			continue
-		}
-		ts := parseTS(rec.Timestamp)
-		var dur time.Duration
-		if d := firstGroup(reNADur, text); d != "" {
-			if ms, e := strconv.Atoi(d); e == nil {
-				dur = time.Duration(ms) * time.Millisecond
+// toolResultText pulls the text out of a tool_result block whose content may be
+// a bare string or an array of {type:text} blocks.
+func toolResultText(b map[string]any) string {
+	switch c := b["content"].(type) {
+	case string:
+		return c
+	case []any:
+		var sb strings.Builder
+		for _, blk := range c {
+			if bb, ok := blk.(map[string]any); ok && bb["type"] == "text" {
+				sb.WriteString(str(bb["text"]))
+				sb.WriteString(" ")
 			}
 		}
-		tokens := 0
-		if t := firstGroup(reNATokens, text); t != "" {
-			tokens, _ = strconv.Atoi(t)
-		}
-		a := &Subagent{ID: id, Name: name, Started: ts.Add(-dur), Ended: ts, Running: false, Tokens: tokens}
-		if _, seen := byTask[id]; !seen {
-			order = append(order, id)
-		}
-		byTask[id] = a // latest notification wins
+		return sb.String()
 	}
-
-	out := make([]Subagent, 0, len(order))
-	for _, id := range order {
-		out = append(out, *byTask[id])
-	}
-	return out
+	return ""
 }
 
 // messageText pulls the plain text out of a message whose content may be a bare
@@ -304,25 +288,6 @@ func firstGroup(re *regexp.Regexp, s string) string {
 		return strings.TrimSpace(m[1])
 	}
 	return ""
-}
-
-// spawnUUID walks a sidechain record up its parent chain to the first
-// non-sidechain ancestor — the assistant message that launched the Task.
-func spawnUUID(r txRec, recs map[string]txRec) string {
-	cur := r
-	seen := map[string]bool{}
-	for cur.parent != "" && !seen[cur.parent] {
-		seen[cur.parent] = true
-		p, ok := recs[cur.parent]
-		if !ok {
-			return cur.parent
-		}
-		if !p.side {
-			return p.uuid
-		}
-		cur = p
-	}
-	return cur.parent
 }
 
 // subagentName prefers the human description, falling back to the agent type.
