@@ -1015,7 +1015,7 @@ func (m Model) footerView(L layout) string {
 	case modeNewSession:
 		keys = []string{k("enter") + " start claude here", k("esc") + " cancel"}
 	case modeObserve:
-		keys = []string{k("↑↓/JK") + " scroll", k("p") + " prompt", k("i") + " interrupt", k("esc") + " exit (read-only)"}
+		keys = []string{k("↑↓/JK") + " scroll", k("p") + " prompt", k("esc") + " exit (read-only)"}
 	case modeCompose:
 		keys = []string{k("enter") + " send", k("shift+enter") + " newline", k("esc") + " cancel"}
 	case modeRename:
@@ -1035,7 +1035,7 @@ func (m Model) footerView(L layout) string {
 			if r, ok := m.selectedRow(); ok && !r.live {
 				endLabel = " forget"
 			}
-			keys = []string{k("↑↓") + " move", k("enter") + " open", k("p") + " prompt", k("i") + " interrupt", k("N") + " new", k("n") + " rename", k("x") + endLabel}
+			keys = []string{k("↑↓") + " move", k("enter") + " open", k("p") + " prompt", k("N") + " new", k("n") + " rename", k("x") + endLabel}
 		case tabPermissions:
 			keys = []string{k("a") + " approve", k("d") + " deny", k("A") + " all", k("s") + " safe-here", k("g") + " auto:" + onOff(m.policy.AllGlobal)}
 		case tabSkills:

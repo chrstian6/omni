@@ -3,7 +3,6 @@
 package main
 
 import (
-	"errors"
 	"os/exec"
 	"strconv"
 	"syscall"
@@ -39,15 +38,4 @@ func endProcess(pid int32) error {
 	cmd := exec.Command("taskkill", "/PID", strconv.Itoa(int(pid)))
 	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
 	return cmd.Run()
-}
-
-// interruptProcess: Windows can't deliver a Ctrl-C to an unrelated console
-// process (GenerateConsoleCtrlEvent only reaches the caller's own console
-// group), so there's no safe "interrupt the current turn" here — the only
-// options are graceful close (endProcess) or a force kill, both of which stop
-// the whole session. Report it as unsupported rather than doing something
-// heavier than the user asked for.
-func interruptProcess(pid int32) error {
-	_ = pid
-	return errors.New("interrupt isn't supported on Windows — use end to stop the session")
 }
