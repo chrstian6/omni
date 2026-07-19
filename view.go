@@ -36,11 +36,20 @@ func (m Model) renderTabBar(L layout) string {
 	logo := lipgloss.NewStyle().Foreground(colAccent).Bold(true).Render("◆ OMNI")
 	b := strings.Builder{}
 	b.WriteString("  " + logo + "   ")
-	for i, name := range tabNames {
-		label := " " + name + " "
-		if tab(i) == m.tab {
+	pendingWaiting := len(m.pending) > 0
+	for i := range tabNames {
+		label := " " + m.tabLabel(i) + " "
+		switch {
+		case tab(i) == m.tab && tab(i) == tabPermissions && pendingWaiting:
+			// Active Permissions tab with work waiting: highlight in the danger
+			// colour so the counter reads as an alert, not just a selected tab.
+			b.WriteString(lipgloss.NewStyle().Foreground(colBG).Background(colDanger).Bold(true).Render(label))
+		case tab(i) == m.tab:
 			b.WriteString(lipgloss.NewStyle().Foreground(colBG).Background(colAccent).Bold(true).Render(label))
-		} else {
+		case tab(i) == tabPermissions && pendingWaiting:
+			// Inactive but pending: red counter draws the eye from any other tab.
+			b.WriteString(styleDanger.Bold(true).Render(label))
+		default:
 			b.WriteString(styleMuted.Render(label))
 		}
 		b.WriteString(" ")

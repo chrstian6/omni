@@ -605,13 +605,27 @@ type tabSpan struct {
 	lo, hi int
 }
 
-// tabSpans is where each tab sits on the tab-bar row. Fixed positions (labels
-// are constant), so mouse hit-testing and rendering stay in sync.
+// tabLabel is the text inside a tab. The Permissions tab carries a live counter
+// of pending approvals so you can see at a glance that something needs a
+// decision — rendering (renderTabBar) and hit-testing (tabSpans) both derive
+// their width from this one place so they never drift.
+func (m Model) tabLabel(i int) string {
+	name := tabNames[i]
+	if tab(i) == tabPermissions {
+		if n := len(m.pending); n > 0 {
+			name += " ●" + itoa(n)
+		}
+	}
+	return name
+}
+
+// tabSpans is where each tab sits on the tab-bar row, derived from tabLabel so
+// mouse hit-testing and rendering stay in sync as the pending counter changes.
 func (m Model) tabSpans() []tabSpan {
 	x := 2 + lipgloss.Width("◆ OMNI") + 3
 	var spans []tabSpan
-	for i, name := range tabNames {
-		w := lipgloss.Width(name) + 2 // " name "
+	for i := range tabNames {
+		w := lipgloss.Width(m.tabLabel(i)) + 2 // " label "
 		spans = append(spans, tabSpan{tab(i), x, x + w})
 		x += w + 1
 	}
