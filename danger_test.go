@@ -1,6 +1,10 @@
 package main
 
-import "testing"
+import (
+	"testing"
+
+	tea "github.com/charmbracelet/bubbletea"
+)
 
 func TestClassify(t *testing.T) {
 	cases := []struct {
@@ -139,5 +143,152 @@ func TestClassifyWarnLevels(t *testing.T) {
 				t.Errorf("%s: got %s %v, want warn", c.cmd, got, reasons)
 			}
 		})
+	}
+}
+
+// A hard block is now overridable, which is only safe if the escape hatch is
+// deliberate. These pin down the guarantees that make it so.
+
+func TestBulkApproveNeverReleasesBlockedOrFlagged(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	pending := []PendingRequest{
+		{ID: "safe-1", SessionID: "s", Risk: riskSafe, Tool: "Read"},
+		{ID: "warn-1", SessionID: "s", Risk: riskWarn, Tool: "Bash"},
+		{ID: "block-1", SessionID: "s", Risk: riskBlock, Tool: "Bash"},
+	}
+
+	// approve-all
+	approveAllCmd(pending)()
+	if _, ok := readDecision("block-1"); ok {
+		t.Error("approve-all released a hard-blocked request")
+	}
+	if _, ok := readDecision("warn-1"); ok {
+		t.Error("approve-all released a flagged request")
+	}
+	if d, ok := readDecision("safe-1"); !ok || !d.Allow {
+		t.Error("approve-all did not approve the safe request")
+	}
+
+	// per-session auto-approve
+	t.Setenv("HOME", t.TempDir())
+	approveSessionSafeCmd(pending, "s")()
+	if _, ok := readDecision("block-1"); ok {
+		t.Error("session auto-approve released a hard-blocked request")
+	}
+	if _, ok := readDecision("warn-1"); ok {
+		t.Error("session auto-approve released a flagged request")
+	}
+}
+
+// The policy that drives auto-approval must only ever cover safe actions.
+func TestPolicyNeverAutoApprovesBlocked(t *testing.T) {
+	p := Policy{AllGlobal: true, AllSessions: map[string]bool{"s": true}}
+	// autoApproves says nothing about risk on its own; the guarantee is that the
+	// hook only consults it for riskSafe. Assert that contract holds by checking
+	// the classifier levels the hook branches on.
+	if !p.autoApproves("s") {
+		t.Fatal("policy should auto-approve for this session")
+	}
+	// A blocked command must classify as block, so it never reaches the
+	// autoApproves branch in runHook.
+	lvl, _ := classify("Bash", map[string]any{"command": "rm -rf /"})
+	if lvl != riskBlock {
+		t.Fatalf("rm -rf / classified as %s, want block", lvl)
+	}
+}
+
+// The typed confirmation is the whole point: anything that is not the word must
+// leave the block in place. Asserted on the returned command — a rejection must
+// produce NO decision command at all, since the decision is what releases it.
+func TestOverrideRequiresExactWord(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	req := PendingRequest{ID: "blk", SessionID: "s", Risk: riskBlock, Tool: "Bash", Summary: "rm -rf /"}
+
+	rejected := []string{"", "override", "OVERRID", "yes", "y", "OVERRIDEE", "OVER RIDE", "0VERRIDE"}
+	for _, typed := range rejected {
+		m := NewModel()
+		m.mode = modeOverride
+		r := req
+		m.overrideReq = &r
+		m.overrideInput.SetValue(typed)
+
+		updated, cmd := m.keyOverride(tea.KeyMsg{Type: tea.KeyEnter})
+		if cmd != nil {
+			cmd() // if it produced anything, make sure it wasn't an approval
+			if _, ok := readDecision(req.ID); ok {
+				t.Fatalf("typing %q released the block", typed)
+			}
+		}
+		got := updated.(Model)
+		if got.mode != modeOverride {
+			t.Errorf("typing %q closed the prompt; it should stay open", typed)
+		}
+		if got.overrideReq == nil {
+			t.Errorf("typing %q dropped the pending override", typed)
+		}
+	}
+}
+
+// Surrounding whitespace is tolerated: the deliberateness lives in typing the
+// word, and forcing a retype over a stray space is friction without safety.
+func TestOverrideToleratesSurroundingWhitespace(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	req := PendingRequest{ID: "blk-ws", SessionID: "s", Risk: riskBlock, Tool: "Bash"}
+	m := NewModel()
+	m.mode = modeOverride
+	r := req
+	m.overrideReq = &r
+	m.overrideInput.SetValue("  " + overrideWord + " ")
+
+	_, cmd := m.keyOverride(tea.KeyMsg{Type: tea.KeyEnter})
+	if cmd == nil {
+		t.Fatal("padded word was rejected")
+	}
+	cmd()
+	if d, ok := readDecision(req.ID); !ok || !d.Allow {
+		t.Fatal("padded word did not release the block")
+	}
+}
+
+func TestOverrideEscapeKeepsItBlocked(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	req := PendingRequest{ID: "blk2", SessionID: "s", Risk: riskBlock, Tool: "Bash"}
+	m := NewModel()
+	m.mode = modeOverride
+	r := req
+	m.overrideReq = &r
+	m.overrideInput.SetValue(overrideWord)
+
+	updated, _ := m.keyOverride(tea.KeyMsg{Type: tea.KeyEsc})
+	got := updated.(Model)
+	if _, ok := readDecision(req.ID); ok {
+		t.Fatal("escaping the override approved the blocked action")
+	}
+	if got.mode != modeList || got.overrideReq != nil {
+		t.Error("escape did not close the override prompt")
+	}
+}
+
+// The exact word must work, or the escape hatch doesn't exist.
+func TestOverrideExactWordReleasesTheBlock(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	req := PendingRequest{ID: "blk3", SessionID: "s", Risk: riskBlock, Tool: "Bash"}
+	m := NewModel()
+	m.mode = modeOverride
+	r := req
+	m.overrideReq = &r
+	m.overrideInput.SetValue(overrideWord)
+
+	updated, cmd := m.keyOverride(tea.KeyMsg{Type: tea.KeyEnter})
+	if cmd == nil {
+		t.Fatal("confirming produced no decision command")
+	}
+	cmd() // run it
+	d, ok := readDecision(req.ID)
+	if !ok || !d.Allow {
+		t.Fatalf("exact word did not release the block: %+v ok=%v", d, ok)
+	}
+	if got := updated.(Model); got.mode != modeList {
+		t.Error("confirming did not close the prompt")
 	}
 }

@@ -260,6 +260,8 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m.keyRename(msg)
 	case modeConfirmEnd:
 		return m.keyConfirmEnd(msg)
+	case modeOverride:
+		return m.keyOverride(msg)
 	case modeCreateAgent:
 		return m.keyCreateAgent(msg)
 	case modeCreateSkill:
@@ -712,6 +714,39 @@ func (m Model) keyConfirmEnd(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+// keyOverride handles the typed confirmation that releases a hard block. The
+// word must match exactly: anything else leaves the block in place. Escape
+// cancels, and cancelling denies nothing — the request simply stays pending
+// until it is denied or times out, which fails closed.
+func (m Model) keyOverride(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "esc":
+		m.mode = modeList
+		m.overrideReq = nil
+		m.overrideInput.Blur()
+		m.setStatus("override cancelled — still blocked", false)
+		return m, nil
+	case "enter":
+		typed := trimSpace(m.overrideInput.Value())
+		if typed != overrideWord {
+			m.setStatus("type "+overrideWord+" exactly to override; still blocked", true)
+			return m, nil
+		}
+		r := m.overrideReq
+		m.mode = modeList
+		m.overrideReq = nil
+		m.overrideInput.Blur()
+		m.overrideInput.SetValue("")
+		if r == nil {
+			return m, nil
+		}
+		return m, decideCmd(*r, true, "hard block overridden by user")
+	}
+	var cmd tea.Cmd
+	m.overrideInput, cmd = m.overrideInput.Update(msg)
+	return m, cmd
+}
+
 // --- Permissions tab ---
 
 func (m Model) keyPermissions(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
@@ -747,6 +782,17 @@ func (m Model) keyPermissions(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 	case "a", "enter":
 		if r, ok := m.selectedPending(); ok {
+			// A hard-blocked action is never approved by this keystroke. It opens a
+			// typed confirmation instead, so clearing a queue of approvals can never
+			// release a catastrophic command by muscle memory.
+			if r.Risk == riskBlock {
+				req := r
+				m.overrideReq = &req
+				m.mode = modeOverride
+				m.overrideInput.SetValue("")
+				m.status = ""
+				return m, m.overrideInput.Focus()
+			}
 			return m, decideCmd(r, true, "approved in Omni")
 		}
 	case "d":
@@ -754,7 +800,7 @@ func (m Model) keyPermissions(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, decideCmd(r, false, "denied in Omni")
 		}
 	case "A":
-		// Approve every non-flagged request at once; flagged ones stay.
+		// Approve every SAFE request at once; flagged and blocked ones stay.
 		return m, approveAllCmd(m.pending)
 	case "g":
 		m.policy.AllGlobal = !m.policy.AllGlobal
@@ -808,7 +854,8 @@ func approveSessionSafeCmd(pending []PendingRequest, sessionID string) tea.Cmd {
 	return func() tea.Msg {
 		n := 0
 		for _, r := range pending {
-			if r.SessionID != sessionID || r.Risk == riskWarn {
+			// Same allowlist rule as approve-all: safe only, never warn or block.
+			if r.SessionID != sessionID || r.Risk != riskSafe {
 				continue
 			}
 			if err := writeDecision(Decision{ID: r.ID, Allow: true, Reason: "auto-approved (session safe)"}); err == nil {
@@ -823,8 +870,12 @@ func approveAllCmd(pending []PendingRequest) tea.Cmd {
 	return func() tea.Msg {
 		n := 0
 		for _, r := range pending {
-			if r.Risk == riskWarn {
-				continue // flagged actions are never bulk-approved
+			// Allowlist, not denylist: only an explicitly SAFE request may be
+			// bulk-approved. Filtering out "warn" alone would have let a hard-blocked
+			// request through the moment blocks started reaching the dashboard, and
+			// a new risk level added later would default to approvable.
+			if r.Risk != riskSafe {
+				continue
 			}
 			if err := writeDecision(Decision{ID: r.ID, Allow: true, Reason: "approve-all"}); err == nil {
 				n++

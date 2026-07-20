@@ -67,11 +67,49 @@ func runHook() int {
 
 	level, reasons := classify(in.ToolName, in.ToolInput)
 
-	// 1. Safety layer: catastrophic actions are denied outright, no human in
-	//    the loop, and recorded for audit.
+	// 1. Safety layer: catastrophic actions are denied by default and always
+	//    recorded. They are still offered to a human, because a classifier that
+	//    is occasionally wrong AND unappealable teaches people to route around
+	//    it — the only escape used to be rewording the command. Overriding one
+	//    takes a deliberate typed confirmation at the dashboard, never a
+	//    keystroke, and is never covered by approve-all.
 	if level == riskBlock {
 		req := toRequest(in, level, reasons)
 		appendBlockedLog(req)
+
+		// No dashboard means no way to confirm deliberately, so a block stays a
+		// block. Note this deliberately does NOT fall through to Claude's own
+		// prompt the way safe/warn requests do: that prompt is a single keypress,
+		// which is far too cheap for a catastrophic action.
+		if !heartbeatFresh() {
+			emit("deny", "Blocked by Omni safety layer: "+strings.Join(reasons, "; "))
+			return 0
+		}
+		if err := writePending(req); err != nil {
+			emit("deny", "Blocked by Omni safety layer: "+strings.Join(reasons, "; "))
+			return 0
+		}
+		defer removePending(req.ID)
+		defer removeDecision(req.ID)
+
+		deadline := time.Now().Add(hookWait)
+		for time.Now().Before(deadline) {
+			if d, ok := readDecision(req.ID); ok {
+				if d.Allow {
+					appendOverrideLog(req, d.Reason)
+					emit("allow", orDefault(d.Reason, "override confirmed in Omni"))
+				} else {
+					emit("deny", orDefault(d.Reason, "Blocked by Omni safety layer: "+strings.Join(reasons, "; ")))
+				}
+				return 0
+			}
+			if !heartbeatFresh() {
+				break
+			}
+			time.Sleep(hookPollStep)
+		}
+		// Timed out, or the dashboard disappeared: stay blocked. Unlike a warn,
+		// the safe default here is deny, not "ask".
 		emit("deny", "Blocked by Omni safety layer: "+strings.Join(reasons, "; "))
 		return 0
 	}

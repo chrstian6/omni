@@ -234,6 +234,7 @@ Dashboard keys:
   enter or p   prompt the selected session (Sessions view)
   f            focus the terminal/IDE window that owns the session
   a / d        approve / deny the selected request (Permissions view)
+               a hard-blocked action needs OVERRIDE typed to confirm
   A            approve all non-flagged pending requests
   g            toggle global auto-approve (flagged actions still ask)
   n            rename a session

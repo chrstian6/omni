@@ -211,6 +211,24 @@ func (p Policy) autoApproves(sessionID string) bool {
 	return p.AllGlobal || p.AllSessions[sessionID]
 }
 
+// appendOverrideLog records that a human deliberately overrode a hard block.
+// Blocked actions are already logged when they're caught; this is the second
+// half of that story, so the audit trail shows not just what was blocked but
+// what was allowed through anyway, and why.
+func appendOverrideLog(r PendingRequest, reason string) {
+	ensureDeckDirs()
+	line := time.Now().Format("2006-01-02 15:04:05") + "  " +
+		r.Project + "  " + r.Tool + "  OVERRIDDEN  " +
+		strings.Join(r.Reasons, "; ") + "  — " + r.Summary +
+		"  [" + reason + "]\n"
+	f, err := os.OpenFile(blockedLogPath(), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	_, _ = f.WriteString(line)
+}
+
 // --- audit log ---
 
 func appendBlockedLog(r PendingRequest) {

@@ -791,8 +791,11 @@ func (m Model) permissionSidebar() []string {
 		if it.pending != nil {
 			r := it.pending
 			mark := dot(colAccent)
-			if r.Risk == riskWarn {
+			switch r.Risk {
+			case riskWarn:
 				mark = styleDanger.Render("▲")
+			case riskBlock:
+				mark = styleDanger.Bold(true).Render("■")
 			}
 			out = append(out, mark+" "+truncate(r.Tool+" · "+r.Project, 28))
 			continue
@@ -840,8 +843,11 @@ func (m Model) permissionMain(L layout) []string {
 	}
 	var b []string
 	head := styleTitle.Render(r.Tool + " · " + r.Project)
-	if r.Risk == riskWarn {
+	switch r.Risk {
+	case riskWarn:
 		head += "  " + lipgloss.NewStyle().Foreground(colBG).Background(colDanger).Bold(true).Render(" DANGER ")
+	case riskBlock:
+		head += "  " + lipgloss.NewStyle().Foreground(colBG).Background(colDanger).Bold(true).Render(" BLOCKED ")
 	}
 	b = append(b, head, styleMuted.Render(r.Cwd), "")
 	b = append(b, styleMuted.Render("COMMAND"))
@@ -854,6 +860,23 @@ func (m Model) permissionMain(L layout) []string {
 	if safeHere {
 		autoLine = styleBusy.Render("● auto-approving safe here") + styleMuted.Render("  [s] turn off")
 	}
+	// A hard block gets its own footer: it is never released by the same
+	// keystroke that clears ordinary approvals, and the reason it was blocked
+	// stays on screen while the confirmation is typed.
+	if r.Risk == riskBlock {
+		b = append(b, "", styleDanger.Bold(true).Render(
+			"This was blocked automatically as catastrophic and almost never intended."))
+		if m.mode == modeOverride && m.overrideReq != nil && m.overrideReq.ID == r.ID {
+			b = append(b, "", styleDanger.Render("Type "+overrideWord+" to run it anyway:"))
+			b = append(b, m.overrideInput.View())
+			b = append(b, styleMuted.Render("enter to confirm · esc to keep it blocked"))
+			return b
+		}
+		b = append(b, "", styleAccent.Render("[d] deny")+
+			styleMuted.Render("    [a] override (requires typing "+overrideWord+")"))
+		return b
+	}
+
 	b = append(b, "", styleAccent.Render("[a] approve    [d] deny")+styleMuted.Render("    [A] approve all safe"))
 	b = append(b, autoLine)
 	return b

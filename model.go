@@ -32,7 +32,15 @@ const (
 	modeCreateSkill // authoring a prompt-only skill from a small form
 	modeObserve     // full-width, read-only view of a session — never interrupts it
 	modeNewSession  // prompting for a directory to start a new `claude` session in
+	// modeOverride asks the user to TYPE a confirmation word before a hard-blocked
+	// action is allowed. A block means "catastrophic and almost never intended",
+	// so the escape hatch is deliberately not a keystroke — it must be impossible
+	// to hit by muscle memory while clearing a queue of approvals.
+	modeOverride
 )
+
+// overrideWord is what must be typed exactly to release a hard block.
+const overrideWord = "OVERRIDE"
 
 var idleThresholds = []time.Duration{
 	60 * time.Second, 5 * time.Minute, 15 * time.Minute, 60 * time.Minute,
@@ -110,6 +118,10 @@ type Model struct {
 	promptHistory []string
 	histIdx       int
 	draft         string // text kept when compose is cancelled, restored on reopen
+
+	// override confirmation: the blocked request awaiting a typed confirmation
+	overrideReq   *PendingRequest
+	overrideInput textinput.Model
 
 	// choice selector: options the model offered, navigable with up/down
 	choices      []choiceOpt
@@ -211,18 +223,22 @@ func NewModel() Model {
 	nd := textinput.New()
 	nd.Placeholder = "~/path/to/project"
 
+	ov := textinput.New()
+	ov.Placeholder = "type " + overrideWord + " to allow this blocked action"
+
 	return Model{
-		cfg:         LoadConfig(),
-		policy:      loadPolicy(),
-		surfaces:    map[string]string{},
-		outboxQueue: map[string][]OutboxMsg{},
-		idleIdx:     1,
-		textarea:    ta,
-		rename:      ti,
-		newDir:      nd,
-		agentForm:   newAgentForm(),
-		skillForm:   newSkillForm(),
-		queue:       map[string][]string{},
+		cfg:           LoadConfig(),
+		policy:        loadPolicy(),
+		surfaces:      map[string]string{},
+		outboxQueue:   map[string][]OutboxMsg{},
+		idleIdx:       1,
+		textarea:      ta,
+		rename:        ti,
+		newDir:        nd,
+		overrideInput: ov,
+		agentForm:     newAgentForm(),
+		skillForm:     newSkillForm(),
+		queue:         map[string][]string{},
 	}
 }
 
