@@ -92,24 +92,34 @@ func loadSubagents(sessionID string) []Subagent {
 			Type      string          `json:"type"`
 			Timestamp string          `json:"timestamp"`
 			Message   json.RawMessage `json:"message"`
+			// A task-notification does NOT arrive as a normal message. It shows up
+			// in its own record shapes, which is why an async agent used to hang
+			// on "running" forever: the completion was in the transcript, just not
+			// anywhere this scanner looked.
+			//   queue-operation → a bare string in "content"
+			//   attachment      → attachment.prompt
+			Content    json.RawMessage `json:"content"`
+			Attachment struct {
+				Prompt string `json:"prompt"`
+			} `json:"attachment"`
 		}
 		if err := json.Unmarshal([]byte(line), &rec); err != nil {
 			continue
 		}
-		if rec.Type != "assistant" && rec.Type != "user" {
-			continue
-		}
 		ts := parseTS(rec.Timestamp)
 
-		// A task-notification is an async agent reporting in — record it against
-		// its tool-use-id (falling back to task-id for older shapes) and move on.
-		if strings.Contains(line, "task-notification") {
-			text := messageText(rec.Message)
-			key := firstGroup(reNAToolUse, text)
-			if key == "" {
-				key = firstGroup(reNATaskID, text)
-			}
-			if key != "" {
+		// An async agent reporting in — record it against its tool-use-id
+		// (falling back to task-id for older shapes). Checked before the record
+		// type filter below, since these records are neither assistant nor user.
+		if blocks := notificationBlocks(rec.Attachment.Prompt, rawString(rec.Content), messageText(rec.Message)); len(blocks) > 0 {
+			for _, text := range blocks {
+				key := firstGroup(reNAToolUse, text)
+				if key == "" {
+					key = firstGroup(reNATaskID, text)
+				}
+				if key == "" {
+					continue
+				}
 				n := notif{ts: ts, status: firstGroup(reNAStatus, text)}
 				if d := firstGroup(reNADur, text); d != "" {
 					if ms, e := strconv.Atoi(d); e == nil {
@@ -120,11 +130,18 @@ func loadSubagents(sessionID string) []Subagent {
 					n.tokens, _ = strconv.Atoi(t)
 				}
 				n.name = firstGroup(reNAName, firstGroup(reNASummary, text))
+				// The same notification is written more than once (enqueue, remove,
+				// attachment). Keying by tool-use-id collapses them to one row, with
+				// the latest winning.
 				if _, seen := notifs[key]; !seen {
 					notifOrder = append(notifOrder, key)
 				}
 				notifs[key] = n
 			}
+			continue
+		}
+
+		if rec.Type != "assistant" && rec.Type != "user" {
 			continue
 		}
 
@@ -229,6 +246,41 @@ var (
 	reNADur     = regexp.MustCompile(`<duration_ms>(\d+)</duration_ms>`)
 	reNAName    = regexp.MustCompile(`Agent\s+"([^"]+)"`)
 )
+
+// reTaskNotif isolates a complete notification element. Matching the WHOLE
+// element (not just the opening tag) is what keeps a transcript that merely
+// *mentions* task-notifications — a file read, a diff, this very source file —
+// from being parsed as one and inventing an agent that never ran.
+var reTaskNotif = regexp.MustCompile(`(?s)<task-notification>(.*?)</task-notification>`)
+
+// notificationBlocks returns every task-notification found across the candidate
+// fields of one transcript record. The notification travels in different places
+// depending on the record shape, so all of them are checked.
+func notificationBlocks(candidates ...string) []string {
+	var out []string
+	for _, c := range candidates {
+		if c == "" || !strings.Contains(c, "<task-notification>") {
+			continue
+		}
+		for _, m := range reTaskNotif.FindAllStringSubmatch(c, -1) {
+			out = append(out, m[1])
+		}
+	}
+	return out
+}
+
+// rawString decodes a JSON field that may be a bare string, returning "" for any
+// other shape (objects, arrays, null).
+func rawString(raw json.RawMessage) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	var s string
+	if json.Unmarshal(raw, &s) == nil {
+		return s
+	}
+	return ""
+}
 
 // isAsyncLaunchAck recognizes the internal tool_result the harness returns when
 // an Agent is launched in the background — it means "started", not "finished".
