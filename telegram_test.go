@@ -519,3 +519,57 @@ func TestConvoReportWithNoSpeakingTurns(t *testing.T) {
 		t.Errorf("expected an explicit empty-state, got %q", got)
 	}
 }
+
+// The question notification must carry the whole question — the reasoning is
+// what makes a decision possible from a phone. Fixed per-option caps used to cut
+// labels mid-sentence and drop descriptions entirely.
+func TestQuestionNotificationIncludesFullText(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	stub := newStubTelegram(t)
+	b := newTestBridge(t, stub, 111)
+
+	long := "Because the lock in Project Memory says Infobip handles BOTH email and SMS, " +
+		"routing SMS through GHL would directly contradict a ratified decision."
+	desc := "Port GHL's OAuth, contact sync, calendars, provisioning and agent-tool webhooks, " +
+		"but route all SMS through Infobip, honouring the existing lock."
+
+	old := float64(time.Now().Add(-10 * time.Minute).UnixMilli())
+	writeLiveSession(t, home, "q-full", "waiting", old)
+	writeTranscriptFor(t, home, "q-full", long+"\n\n1. Keep Infobip for SMS; port GHL minus SMS\n   "+desc+"\n2. Port GHL SMS too\n   Full legacy fidelity.\n")
+
+	b.syncQuestions()
+
+	stub.mu.Lock()
+	defer stub.mu.Unlock()
+	if len(stub.bodies) == 0 {
+		t.Fatal("no notification sent")
+	}
+	text, _ := stub.bodies[0]["text"].(string)
+	if !strings.Contains(text, long) {
+		t.Error("the question's reasoning was not included")
+	}
+	if !strings.Contains(text, desc) {
+		t.Error("the option description was truncated or dropped")
+	}
+	if !strings.Contains(text, "Keep Infobip for SMS; port GHL minus SMS") {
+		t.Error("the option label was truncated")
+	}
+	if len(text) > telegramMaxText {
+		t.Errorf("message is %d chars, over Telegram's %d limit", len(text), telegramMaxText)
+	}
+}
+
+// A genuinely enormous question must be cut on our side and say so: Telegram
+// refuses an over-length message outright rather than truncating it, which would
+// drop the notification entirely and leave a session silently waiting.
+func TestOverLongQuestionIsTrimmedNotDropped(t *testing.T) {
+	huge := strings.Repeat("reasoning ", 1000)
+	got := fitTelegram(huge)
+	if len(got) > telegramMaxText {
+		t.Fatalf("fitTelegram returned %d chars, over the %d limit", len(got), telegramMaxText)
+	}
+	if !strings.Contains(got, "truncated") {
+		t.Error("a trimmed message must say it was trimmed")
+	}
+}

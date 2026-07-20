@@ -486,10 +486,19 @@ func (b *TelegramBridge) syncQuestions() {
 		var sb strings.Builder
 		sb.WriteString(s.Project() + " is waiting on you\n")
 		sb.WriteString("(idle " + formatDuration(s.QuietFor()) + ")\n\n")
+
+		// The question itself, not just the options. Fixed per-option caps used to
+		// cut labels mid-sentence and drop the reasoning entirely, which is the
+		// part you actually need to decide. Everything is included and the whole
+		// message is budgeted against Telegram's limit instead, so only a genuinely
+		// enormous question loses anything — and it says so when it does.
+		if q := questionPreamble(s.SessionID); q != "" {
+			sb.WriteString(q + "\n\n")
+		}
 		for _, o := range opts {
-			sb.WriteString(o.marker + ". " + truncate(oneLine(o.label), 90) + "\n")
+			sb.WriteString(o.marker + ". " + strings.TrimSpace(o.label) + "\n")
 			if o.desc != "" {
-				sb.WriteString("   " + truncate(oneLine(o.desc), 110) + "\n")
+				sb.WriteString("   " + strings.TrimSpace(o.desc) + "\n")
 			}
 		}
 		msg := map[string]any{"chat_id": b.cfg.ChatID}
@@ -513,7 +522,7 @@ func (b *TelegramBridge) syncQuestions() {
 			sb.WriteString("\nAnswer at the terminal — a reply queued from here would")
 			sb.WriteString(" not be delivered while the session sits idle.")
 		}
-		msg["text"] = sb.String()
+		msg["text"] = fitTelegram(sb.String())
 		_ = b.call("sendMessage", msg, nil)
 	}
 }
@@ -576,6 +585,42 @@ func convoReport(s Session, turns int) string {
 		out = out[:telegramMaxText-20] + "\n…(truncated)"
 	}
 	return out
+}
+
+// questionPreamble is what the session said BEFORE listing its options — the
+// actual question and the reasoning behind it. The options alone are often
+// meaningless on a phone ("1. Keep Infobip" tells you nothing about why), so
+// this is the part that makes a decision possible without walking to the desk.
+func questionPreamble(sessionID string) string {
+	convo := loadConvo(sessionID)
+	for i := len(convo) - 1; i >= 0; i-- {
+		if convo[i].role != "claude" || strings.TrimSpace(convo[i].text) == "" {
+			continue
+		}
+		lines := strings.Split(convo[i].text, "\n")
+		// Everything up to the first option line is the question.
+		var head []string
+		for _, ln := range lines {
+			if reChoice.MatchString(ln) {
+				break
+			}
+			head = append(head, ln)
+		}
+		return strings.TrimSpace(strings.Join(head, "\n"))
+	}
+	return ""
+}
+
+// fitTelegram trims a message to Telegram's hard limit, saying so rather than
+// letting the API reject the whole thing — an over-length message is not
+// truncated by Telegram, it is refused, which would drop the notification
+// entirely and leave a session silently waiting.
+func fitTelegram(s string) string {
+	if len(s) <= telegramMaxText {
+		return s
+	}
+	const note = "\n\n…(truncated — see the terminal for the full question)"
+	return s[:telegramMaxText-len(note)] + note
 }
 
 // phoneIdleThreshold is when "quiet" stops meaning "between turns" and starts
