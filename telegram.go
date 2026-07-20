@@ -369,7 +369,7 @@ func statusReport() string {
 		if n := len(act.Todos); n > 0 {
 			b.WriteString(fmt.Sprintf("  tasks: %d/%d done\n", act.DoneCount(), n))
 		}
-		if running := runningCount(loadSubagents(s.SessionID)); running > 0 {
+		if running := runningCount(ReconcileAgents(loadSubagents(s.SessionID), s.StartedTime())); running > 0 {
 			b.WriteString(fmt.Sprintf("  agents: %d running\n", running))
 		}
 		if q := len(loadOutbox(s.SessionID)); q > 0 {

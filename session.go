@@ -37,6 +37,15 @@ func (s Session) Project() string {
 
 func (s Session) IsBusy() bool { return s.Status == "busy" }
 
+// StartedTime is when this PROCESS started. A resumed session keeps its id and
+// transcript, so this is the only marker of where the previous runtime ended.
+func (s Session) StartedTime() time.Time {
+	if s.StartedAt == 0 {
+		return time.Time{}
+	}
+	return time.UnixMilli(int64(s.StartedAt))
+}
+
 // QuietFor is how long it's been since the session last changed status.
 func (s Session) QuietFor() time.Duration {
 	if s.StatusUpdatedAt == 0 {

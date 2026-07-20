@@ -58,7 +58,15 @@ func LoadActivity(sessionID string) Activity {
 		a.Title, a.LastPrompt = loadSummary(transcript)
 	}
 	a.Steps = loadSteps(sessionID)
+	// Agents launched by a previous process for this session can never report in,
+	// so reconcile them against when the current process started.
 	a.Agents = loadSubagents(sessionID)
+	for _, live := range LoadSessions() {
+		if live.SessionID == sessionID {
+			a.Agents = ReconcileAgents(a.Agents, live.StartedTime())
+			break
+		}
+	}
 	return a
 }
 

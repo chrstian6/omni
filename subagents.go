@@ -24,6 +24,35 @@ type Subagent struct {
 	Ended   time.Time // zero while still running
 	Running bool
 	Tokens  int // output tokens produced by this agent (see attribution note)
+	// Orphan means the agent can never finish: it was launched by an EARLIER
+	// process for this session, so whatever was running died with that process
+	// and its completion notification will never arrive. Without this it shows
+	// as "running" with a clock that ticks forever — which is exactly what a
+	// resumed session looks like after a crash or a kill.
+	Orphan bool
+}
+
+// ReconcileAgents marks agents that predate the session's current process as
+// orphaned rather than running. Compare against when the PROCESS started, not
+// when the conversation did: a resumed session keeps its id and transcript, so
+// only the process boundary reveals that the agent's runtime is gone.
+func ReconcileAgents(agents []Subagent, processStart time.Time) []Subagent {
+	if processStart.IsZero() {
+		return agents
+	}
+	out := make([]Subagent, len(agents))
+	copy(out, agents)
+	for i := range out {
+		if out[i].Running && !out[i].Started.IsZero() && out[i].Started.Before(processStart) {
+			out[i].Running = false
+			out[i].Orphan = true
+			// Freeze the clock at the process boundary: it stopped being real then.
+			if out[i].Ended.IsZero() {
+				out[i].Ended = processStart
+			}
+		}
+	}
+	return out
 }
 
 // Elapsed is how long the agent ran (finished) or has been running (live).

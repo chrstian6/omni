@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // An async agent's completion does not arrive as a normal message. It lands in
@@ -154,5 +155,60 @@ func assertFinished(t *testing.T, agents []Subagent) {
 	}
 	if a.Elapsed() <= 0 || a.Elapsed().Hours() > 1 {
 		t.Errorf("elapsed = %s, want a short real duration (not a runaway clock)", a.Elapsed())
+	}
+}
+
+// An agent launched by a previous process for this session died with that
+// process, so it can never report completion. Left alone it shows as "running"
+// with a clock that ticks forever — which is what a resumed session looks like
+// after a crash or a kill.
+func TestReconcileMarksPreRestartAgentsAsOrphans(t *testing.T) {
+	processStart := time.Date(2026, 7, 20, 12, 27, 0, 0, time.UTC)
+
+	agents := []Subagent{
+		{ID: "old", Running: true, Started: processStart.Add(-7 * time.Minute)},
+		{ID: "new", Running: true, Started: processStart.Add(2 * time.Minute)},
+		{ID: "done", Running: false, Started: processStart.Add(-9 * time.Minute), Ended: processStart.Add(-8 * time.Minute)},
+	}
+
+	got := ReconcileAgents(agents, processStart)
+
+	if !got[0].Orphan || got[0].Running {
+		t.Errorf("pre-restart agent should be an orphan, not running: %+v", got[0])
+	}
+	if got[0].Ended != processStart {
+		t.Errorf("orphan's clock should stop at the process boundary, got %v", got[0].Ended)
+	}
+	if got[0].Elapsed() > 8*time.Minute {
+		t.Errorf("orphan elapsed should be frozen, got %s", got[0].Elapsed())
+	}
+	if got[1].Orphan || !got[1].Running {
+		t.Errorf("agent started after the process must stay running: %+v", got[1])
+	}
+	if got[2].Orphan {
+		t.Errorf("an already-finished agent must not be marked an orphan: %+v", got[2])
+	}
+}
+
+// Without a known process start we must not guess — leaving an agent running is
+// better than falsely reporting real work as dead.
+func TestReconcileIsANoOpWithoutAProcessStart(t *testing.T) {
+	agents := []Subagent{{ID: "a", Running: true, Started: time.Now().Add(-time.Hour)}}
+	got := ReconcileAgents(agents, time.Time{})
+	if got[0].Orphan || !got[0].Running {
+		t.Error("with no process start, agents must be left untouched")
+	}
+}
+
+// runningCount must not include orphans, since that count drives "N agents
+// running" in the dashboard and on the phone.
+func TestOrphansDoNotCountAsRunning(t *testing.T) {
+	start := time.Now()
+	agents := ReconcileAgents([]Subagent{
+		{ID: "ghost", Running: true, Started: start.Add(-time.Hour)},
+		{ID: "live", Running: true, Started: start.Add(time.Minute)},
+	}, start)
+	if n := runningCount(agents); n != 1 {
+		t.Fatalf("runningCount = %d, want 1 (the ghost must not count)", n)
 	}
 }

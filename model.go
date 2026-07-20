@@ -325,7 +325,7 @@ func loadLiveAgentsCmd(sessions []Session) tea.Cmd {
 	return func() tea.Msg {
 		var out []liveAgent
 		for _, s := range sessions {
-			for _, a := range loadSubagents(s.SessionID) {
+			for _, a := range ReconcileAgents(loadSubagents(s.SessionID), s.StartedTime()) {
 				out = append(out, liveAgent{SessionID: s.SessionID, sub: a})
 			}
 		}
