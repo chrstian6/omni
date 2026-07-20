@@ -67,6 +67,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.surfacesStale() {
 			m.surfaces = DetectSurfaces(m.sessions)
 		}
+		// A queued message is a promise to deliver into a live process. Once that
+		// process is gone the promise can't be kept, so drop those queues rather
+		// than show a delivery that will never happen.
+		pruneOutbox(m.sessions)
+		m.refreshOutboxQueue()
 		// Fold live sessions into the durable store, then recompute which saved
 		// sessions are no longer live so they show under "recently ended".
 		upsertHistory(m.sessions,
@@ -119,7 +124,16 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.convoID = msg.sessionID
 			// Detect an offered choice list, but never override the user mid-type.
 			if m.mode != modeCompose {
-				m.choices = detectChoices(m.convo)
+				found := detectChoices(m.convo)
+				// Suppress a menu the user already answered — it lingers in the
+				// transcript until the session actually acts on the pick, and showing
+				// it again reads as "that didn't work" and invites a duplicate.
+				if key := choicesKey(found); key != "" && key == m.answeredChoices {
+					found = nil
+				} else if key != m.answeredChoices {
+					m.answeredChoices = "" // a genuinely new menu; start listening again
+				}
+				m.choices = found
 				if m.choiceCursor >= len(m.choices) {
 					m.choiceCursor = max(0, len(m.choices)-1)
 				}
@@ -202,11 +216,18 @@ func (m Model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 	// Click in the sidebar list → select that row.
 	if msg.X < L.sidebarW && msg.Y >= L.bodyTop && msg.Y < L.bodyTop+L.bodyH {
 		idx := m.listOffset + (msg.Y - L.bodyTop)
+		if m.tab == tabSessions {
+			// The Sessions sidebar interleaves group headers, so the clicked line
+			// has to be translated back to a row; clicking a header selects nothing.
+			row, ok := m.rowForSidebarLine(idx)
+			if !ok {
+				return m, nil
+			}
+			m.setActiveCursor(row)
+			return m.onSessionCursorMove()
+		}
 		if idx >= 0 && idx < m.activeLen() {
 			m.setActiveCursor(idx)
-			if m.tab == tabSessions {
-				return m.onSessionCursorMove()
-			}
 		}
 	}
 	return m, nil
@@ -253,7 +274,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "q", "ctrl+c":
 		m.quitting = true
-		removeHeartbeat()
+		m.quitCleanup()
 		return m, tea.Quit
 	case "tab", "right", "l":
 		return m.switchTab((m.tab + 1) % tab(len(tabNames)))
@@ -303,12 +324,23 @@ func (m Model) keySessions(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, nil
 		case "enter":
 			if r, ok := m.selectedRow(); ok && r.live && m.choiceCursor < len(m.choices) {
-				pick := m.choices[m.choiceCursor].marker
+				opt := m.choices[m.choiceCursor]
+				// Send the whole option, not just its marker. A bare "1" is
+				// meaningless by the time it lands: delivery happens after the turn
+				// ended, so the session has to be told WHICH option was picked
+				// rather than be trusted to still have the menu in mind.
+				pick := opt.marker
+				if opt.label != "" {
+					pick += ". " + opt.label
+				}
+				// Remember what was answered so the same menu — still sitting in an
+				// unchanged transcript — doesn't pop straight back up and invite a
+				// second, duplicate pick.
+				m.answeredChoices = choicesKey(m.choices)
 				m.choices = nil
-				m.sending = true
 				m.status = ""
 				m.lastReply = ""
-				return m, sendPromptCmd(pick, r.s)
+				return m, m.deliverPrompt(r, pick)
 			}
 			return m, nil
 		case "esc":
@@ -318,11 +350,7 @@ func (m Model) keySessions(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			// Type a free answer instead of picking.
 			m.choices = nil
 			if r, ok := m.selectedRow(); ok && r.live {
-				m.mode = modeCompose
-				m.status = ""
-				m.lastReply = ""
-				m.textarea.Reset()
-				return m, m.textarea.Focus()
+				return m, m.beginCompose()
 			}
 			return m, nil
 		}
@@ -358,12 +386,25 @@ func (m Model) keySessions(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if _, ok := m.selectedRow(); ok {
 			// No busy-guard: a prompt sent to a working session is queued by Claude
 			// on its side, so composing never interrupts the live turn.
-			m.mode = modeCompose
-			m.status = ""
-			m.lastReply = ""
-			m.textarea.Reset()
-			return m, m.textarea.Focus()
+			return m, m.beginCompose()
 		}
+	case "f":
+		// Jump to the window that owns this session. The point of the whole
+		// delivery model is that the originating terminal is where the work
+		// happens — so give the user a one-key path back to it, which is also how
+		// you flush a queue waiting on an idle session.
+		if r, ok := m.selectedRow(); ok && r.live {
+			label := m.surfaceOf(r.s)
+			switch focused, err := FocusSurface(label); {
+			case err != nil:
+				m.setStatus("could not focus "+label+": "+err.Error(), true)
+			case !focused:
+				m.setStatus("can't focus "+label+" from here — session runs in "+label, true)
+			default:
+				m.setStatus("focused "+label, false)
+			}
+		}
+		return m, nil
 	case "N":
 		// Start a new `claude` session — prompt for a directory, defaulting to the
 		// selected session's project (or home).
@@ -512,11 +553,17 @@ func (m *Model) refreshHookStatus(projectDir string) {
 func (m Model) keyCompose(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "esc":
+		// Keep the half-typed message as a draft so cancelling doesn't lose it —
+		// reopening the prompt bar restores it, and the status line shows a peek.
+		m.draft = m.textarea.Value()
+		if d := trimSpace(m.draft); d != "" {
+			m.setStatus("draft kept: "+truncate(oneLine(d), 48), false)
+		}
 		m.mode = modeList
 		m.textarea.Blur()
 		return m, nil
 	case "enter", "ctrl+s":
-		s, ok := m.selectedSession()
+		r, ok := m.selectedRow()
 		if !ok {
 			return m, nil
 		}
@@ -529,16 +576,11 @@ func (m Model) keyCompose(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.promptHistory = append(m.promptHistory, text)
 		m.histIdx = len(m.promptHistory)
 		m.textarea.Reset()
+		m.draft = "" // it's on its way — nothing to restore
 		m.status = ""
 		m.lastReply = ""
-		// Queue it. If a send is already running it waits its turn; otherwise it
-		// starts now. Either way, sends stay serial.
-		m.enqueue(s.SessionID, text)
-		if m.sendConn != "" {
-			m.setStatus("queued ("+itoa(m.queueLen(s.SessionID))+" waiting)", false)
-			return m, nil
-		}
-		return m.startNextSend()
+		// Hand off to the owning terminal (live) or resume it (ended).
+		return m, m.deliverPrompt(r, text)
 	case "shift+enter", "alt+enter", "ctrl+j":
 		// Explicit newline — Enter is reserved for send.
 		m.textarea.InsertString("\n")
@@ -609,16 +651,12 @@ func (m Model) keyObserve(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case "ctrl+c":
 		m.quitting = true
-		removeHeartbeat()
+		m.quitCleanup()
 		return m, tea.Quit
 	case "p":
 		// Jump straight from observing to composing a prompt.
 		if _, ok := m.selectedRow(); ok {
-			m.mode = modeCompose
-			m.status = ""
-			m.lastReply = ""
-			m.textarea.Reset()
-			return m, m.textarea.Focus()
+			return m, m.beginCompose()
 		}
 	case "up", "k":
 		return m.scrollMain(-1), nil

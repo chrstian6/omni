@@ -105,9 +105,16 @@ func (m Model) renderBody(L layout) string {
 // rows tall (padded/clipped), with the selection highlighted.
 func (m Model) sidebarLines(L layout) []string {
 	var items []string
+	cursor := m.activeCursor()
 	switch m.tab {
 	case tabSessions:
-		items = m.sessionSidebar()
+		// The Sessions list interleaves non-selectable group headers, so the
+		// cursor (an index into rows()) has to be mapped to its display line.
+		var lineForRow []int
+		items, lineForRow = m.sessionSidebar()
+		if cursor >= 0 && cursor < len(lineForRow) {
+			cursor = lineForRow[cursor]
+		}
 	case tabPermissions:
 		items = m.permissionSidebar()
 	case tabSkills:
@@ -116,7 +123,6 @@ func (m Model) sidebarLines(L layout) []string {
 		items = m.agentSidebar()
 	}
 
-	cursor := m.activeCursor()
 	off := m.listOffset
 	// Keep the cursor within the visible window.
 	if cursor < off {
@@ -239,16 +245,34 @@ func (m Model) sessionPanel(L layout) []string {
 
 // --- Sessions sidebar + main ---
 
-func (m Model) sessionSidebar() []string {
+// sessionSidebar renders the session list grouped under the surface that owns
+// each session, and returns lineForRow so the caller can translate the
+// selection cursor (which indexes rows()) into display-line space — the group
+// headers are rendered lines but are not selectable.
+func (m Model) sessionSidebar() ([]string, []int) {
 	rows := m.rows()
 	if len(rows) == 0 {
-		return []string{styleMuted.Render(" no sessions")}
+		return []string{styleMuted.Render(" no sessions")}, nil
 	}
-	var out []string
-	for _, r := range rows {
+
+	lines := make([]string, 0, len(rows)+4)
+	lineForRow := make([]int, len(rows))
+	group := "" // the header currently open
+
+	for i, r := range rows {
+		// Open a new group whenever ownership changes. Ended sessions have no
+		// owning process left, so they get their own trailing group.
+		want := m.surfaceOf(r.s)
+		if !r.live {
+			want = "ended"
+		}
+		if want != group {
+			group = want
+			lines = append(lines, styleMuted.Render(strings.ToUpper(group)))
+		}
+
 		s := r.s
-		var d, name string
-		name = m.cfg.DisplayName(s)
+		name := m.cfg.DisplayName(s)
 		if !r.live {
 			if nick, ok := m.cfg.Nicknames[s.SessionID]; ok {
 				name = nick
@@ -256,6 +280,8 @@ func (m Model) sessionSidebar() []string {
 				name = r.saved.Name
 			}
 		}
+
+		var d string
 		switch {
 		case !r.live:
 			d = styleMuted.Render("○")
@@ -266,26 +292,56 @@ func (m Model) sessionSidebar() []string {
 		default:
 			d = dot(colMuted)
 		}
-		sub := ""
-		if r.live {
-			if s.IsBusy() {
-				sub = styleBusy.Render("working")
-			} else {
-				sub = styleMuted.Render(m.surfaceOf(s) + " · " + formatDuration(s.QuietFor()))
-			}
-		} else {
-			sub = styleMuted.Render("ended " + formatDuration(r.saved.EndedAgo()) + " ago")
+
+		// A queue badge, so a message waiting on an idle session is visible from
+		// the list instead of only on the session you happen to have selected.
+		badge := ""
+		if n := len(m.outboxQueue[s.SessionID]); r.live && n > 0 {
+			badge = styleAccent.Render(" ✉" + itoa(n))
 		}
-		out = append(out, d+" "+truncate(name, 26)+"\n   "+sub)
+
+		lineForRow[i] = len(lines)
+		lines = append(lines, "  "+d+" "+truncate(name, 22)+badge)
 	}
-	// Flatten two-line rows into single lines by splitting — but the sidebar
-	// renderer treats each slice entry as one line, so keep it to one line.
-	flat := make([]string, 0, len(out))
-	for _, o := range out {
-		parts := strings.SplitN(o, "\n", 2)
-		flat = append(flat, parts[0])
+	return lines, lineForRow
+}
+
+// outboxLines shows what's waiting to be handed to this session, and says
+// plainly when it will land. An idle session can't be interrupted from outside —
+// its Stop hook only fires at the end of a turn — so a queued message sits until
+// that terminal runs again. Showing it here (with the key that jumps to the
+// owning window) keeps that wait visible instead of looking like a lost message.
+func (m Model) outboxLines(r sessRow, L layout) []string {
+	if !r.live {
+		return nil
 	}
-	return flat
+	queued := m.outboxQueue[r.s.SessionID]
+	if len(queued) == 0 {
+		return nil
+	}
+	surface := m.surfaceOf(r.s)
+	when := "delivers on its next turn · f to focus " + surface
+	if r.s.IsBusy() {
+		when = "delivers when this turn ends"
+	}
+	b := []string{styleAccent.Render("✉ "+itoa(len(queued))+" queued for "+surface) + styleMuted.Render(" — "+when)}
+	for _, msg := range queued {
+		b = append(b, styleMuted.Render("   ")+styleRow.Render(truncate(oneLine(msg.Text), L.mainW-6)))
+	}
+	return b
+}
+
+// rowForSidebarLine maps a rendered sidebar line back to the row it shows, so a
+// click selects the right session now that group headers occupy lines of their
+// own. Clicking a header selects nothing.
+func (m Model) rowForSidebarLine(line int) (int, bool) {
+	_, lineForRow := m.sessionSidebar()
+	for row, l := range lineForRow {
+		if l == line {
+			return row, true
+		}
+	}
+	return 0, false
 }
 
 // sessionHeader is the sticky top of the detail panel: title, cwd, hook status,
@@ -309,15 +365,18 @@ func (m Model) sessionHeader(L layout) []string {
 	}
 	head := styleTitle.Render(title)
 	if r.live {
+		// Ownership is always shown, working or not: it's the answer to "where do
+		// my prompts actually land?" and it never stops being true.
+		owner := styleMuted.Render("● " + m.surfaceOf(s))
 		if s.IsBusy() {
-			head += "  " + styleBusy.Render("● working")
-		} else {
-			head += "  " + styleMuted.Render("● "+m.surfaceOf(s))
+			owner = styleBusy.Render("● working") + styleMuted.Render(" in "+m.surfaceOf(s))
 		}
+		head += "  " + owner
 	} else {
 		head += "  " + styleMuted.Render("○ ended "+formatDuration(r.saved.EndedAgo())+" ago")
 	}
 	b = append(b, head, styleMuted.Render(s.Cwd))
+	b = append(b, m.outboxLines(r, L)...)
 
 	// Live status + AGENTS come first so they survive if the header is clipped —
 	// this is the live mirror of what the real session is doing right now.
@@ -414,6 +473,11 @@ func (m Model) sessionFooter(L layout) []string {
 				line = "  " + styleAccent.Render("▶ "+c.marker+") ") + styleTitle.Render(truncate(c.label, L.mainW-8))
 			}
 			b = append(b, line)
+			// Show the option's description under the highlighted row only, so the
+			// selector stays compact but the current pick is fully explained.
+			if i == m.choiceCursor && c.desc != "" {
+				b = append(b, "     "+styleMuted.Render(truncate(c.desc, L.mainW-8)))
+			}
 		}
 		return b
 	}
@@ -1035,7 +1099,7 @@ func (m Model) footerView(L layout) string {
 			if r, ok := m.selectedRow(); ok && !r.live {
 				endLabel = " forget"
 			}
-			keys = []string{k("↑↓") + " move", k("enter") + " open", k("p") + " prompt", k("N") + " new", k("n") + " rename", k("x") + endLabel}
+			keys = []string{k("↑↓") + " move", k("enter") + " open", k("p") + " prompt", k("f") + " focus", k("N") + " new", k("n") + " rename", k("x") + endLabel}
 		case tabPermissions:
 			keys = []string{k("a") + " approve", k("d") + " deny", k("A") + " all", k("s") + " safe-here", k("g") + " auto:" + onOff(m.policy.AllGlobal)}
 		case tabSkills:

@@ -20,6 +20,10 @@ type hookInput struct {
 	ToolName  string         `json:"tool_name"`
 	ToolInput map[string]any `json:"tool_input"`
 	Cwd       string         `json:"cwd"`
+
+	// StopHookActive is set by Claude on the 2nd+ Stop invocation within one
+	// turn — i.e. we blocked once already and it came back around.
+	StopHookActive bool `json:"stop_hook_active"`
 }
 
 // hookOutput is the current PreToolUse contract: permissionDecision of
@@ -117,6 +121,96 @@ func runHook() int {
 	// Timed out with no answer — defer to the normal prompt.
 	emit("ask", "Omni: no response, showing the normal prompt")
 	return 0
+}
+
+// stopOutput is the Stop hook contract. Returning decision "block" keeps the
+// session going and feeds `reason` back to Claude instead of letting it stop.
+type stopOutput struct {
+	Decision string `json:"decision,omitempty"`
+	Reason   string `json:"reason,omitempty"`
+}
+
+// runStopHook is the `omni stop-hook` entrypoint, and the whole reason a prompt
+// sent from the dashboard lands in the terminal that owns the session.
+//
+// It runs INSIDE the real session process — the one started in VS Code — every
+// time that session finishes a turn. If the dashboard queued anything for this
+// session, we hand it over here and block the stop, so the session picks the
+// message up and answers it in its own window. No second process, no forked
+// transcript, no divergence: the originating terminal stays the only writer.
+//
+// The trade-off is honest and worth stating: Stop only fires at the END of a
+// turn, so a message queued for a session sitting idle at its prompt waits
+// until that session runs again. We queue rather than fork — the dashboard
+// shows it as pending so it's never a silent drop.
+func runStopHook() int {
+	// A Stop hook that panics or hangs would wedge a real session. Every failure
+	// path here falls through to "no decision", which just lets it stop normally.
+	defer func() {
+		if r := recover(); r != nil {
+			emitStop(stopOutput{})
+		}
+	}()
+
+	raw, err := io.ReadAll(io.LimitReader(os.Stdin, 4<<20))
+	if err != nil {
+		emitStop(stopOutput{})
+		return 0
+	}
+	var in hookInput
+	if err := json.Unmarshal(raw, &in); err != nil || in.SessionID == "" {
+		emitStop(stopOutput{})
+		return 0
+	}
+
+	queued := loadOutbox(in.SessionID)
+	if len(queued) == 0 {
+		emitStop(stopOutput{}) // nothing waiting — let the session stop
+		return 0
+	}
+
+	// Deliver everything queued as one turn, in arrival order, and delete each
+	// as it goes out. Removing them here is the loop guard: blocking makes Claude
+	// respond and fire Stop again, but the queue is empty by then so the next
+	// call returns no decision. StopHookActive is only a belt-and-braces check —
+	// if we somehow re-enter with messages still present, deliver nothing.
+	if in.StopHookActive && len(queued) > 0 {
+		// Re-entered with a non-empty queue: something queued mid-turn. That's a
+		// legitimate new message, but delivering it now risks a tight loop if the
+		// dashboard is enqueuing faster than turns complete. Leave it for the next
+		// natural stop instead.
+		emitStop(stopOutput{})
+		return 0
+	}
+
+	var parts []string
+	for _, m := range queued {
+		parts = append(parts, m.Text)
+		removeOutbox(in.SessionID, m.ID)
+	}
+
+	emitStop(stopOutput{
+		Decision: "block",
+		Reason:   framePrompt(parts),
+	})
+	return 0
+}
+
+// framePrompt labels the delivered text as the user speaking. Claude Code
+// renders a blocked stop as "Stop hook feedback: <reason>", which on its own
+// reads like tooling output — a bare answer such as "1" arrives with no hint
+// that a person sent it or what it responds to. The prefix restores that.
+func framePrompt(parts []string) string {
+	body := strings.Join(parts, "\n\n")
+	lead := "The user sent this from the Omni dashboard. Treat it as their next message and respond to it directly:"
+	if len(parts) > 1 {
+		lead = "The user sent these from the Omni dashboard, in order. Treat them as their next messages and respond directly:"
+	}
+	return lead + "\n\n" + body
+}
+
+func emitStop(out stopOutput) {
+	_ = json.NewEncoder(os.Stdout).Encode(out)
 }
 
 func toRequest(in hookInput, level string, reasons []string) PendingRequest {

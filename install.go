@@ -33,17 +33,38 @@ func selfPath() string {
 	return exe
 }
 
-// hookEntry is the matcher group we install: match every tool ("*") and run
-// `omni hook`. A generous timeout so a real human has time to answer;
-// the hook itself gives up sooner and defers, so this ceiling is rarely hit.
-func hookEntry() map[string]any {
+// hookEvents are the two settings.json arrays we manage, and the subcommand
+// each one runs:
+//
+//   - PreToolUse → `omni hook`, the permission gate.
+//   - Stop       → `omni stop-hook`, which delivers prompts queued from the
+//     dashboard into this very session, so a message sent from Omni is answered
+//     by the terminal that owns the session rather than by a forked process.
+//
+// Both are installed and removed together — the dashboard's send path depends
+// on the Stop hook being present, so a half-install would silently strand
+// queued messages.
+var hookEvents = []struct {
+	event string
+	sub   string
+	// timeout in seconds; the permission gate may wait on a human, delivery is
+	// a local file read and should never linger.
+	timeout int
+}{
+	{"PreToolUse", "hook", 120},
+	{"Stop", "stop-hook", 10},
+}
+
+// hookEntryFor builds the matcher group for one event: match everything ("*")
+// and run the given subcommand.
+func hookEntryFor(sub string, timeout int) map[string]any {
 	return map[string]any{
 		"matcher": "*",
 		"hooks": []any{
 			map[string]any{
 				"type":    "command",
-				"command": quoteIfNeeded(selfPath()) + " hook",
-				"timeout": 120,
+				"command": quoteIfNeeded(selfPath()) + " " + sub,
+				"timeout": timeout,
 				"_source": hookMarker,
 			},
 		},
@@ -77,30 +98,37 @@ func installHookAt(path string) (bool, error) {
 		hooks = map[string]any{}
 	}
 
-	pre, _ := hooks["PreToolUse"].([]any)
-	// Drop any prior omni entry so we can refresh the binary path, then
-	// re-add. Leave every other PreToolUse hook untouched.
-	var kept []any
-	for _, group := range pre {
-		if !isOurEntry(group) {
-			kept = append(kept, group)
+	changed := false
+	for _, ev := range hookEvents {
+		existing, _ := hooks[ev.event].([]any)
+		// Drop any prior omni entry so we can refresh the binary path, then
+		// re-add. Leave every other hook on this event untouched.
+		var kept []any
+		for _, group := range existing {
+			if !isOurEntry(group) {
+				kept = append(kept, group)
+			}
 		}
+
+		desired := hookEntryFor(ev.sub, ev.timeout)
+		updated := append(kept, desired)
+
+		// If an identical entry was already present, this event needs no rewrite.
+		if len(existing) == len(updated) && ourEntryMatches(existing, desired) {
+			continue
+		}
+		hooks[ev.event] = updated
+		changed = true
 	}
-
-	desired := hookEntry()
-	newPre := append(kept, desired)
-
-	// If an identical entry was already present, don't rewrite the file.
-	if len(pre) == len(newPre) && ourEntryMatches(pre, desired) {
+	if !changed {
 		return false, nil
 	}
-
-	hooks["PreToolUse"] = newPre
 	settings["hooks"] = hooks
 
 	if err := writeSettings(path, settings); err != nil {
 		return false, err
 	}
+	recordInstall(path) // remember it so quit can restore this file
 	return true, nil
 }
 
@@ -120,27 +148,124 @@ func uninstallHookAt(path string) (bool, error) {
 	if hooks == nil {
 		return false, nil
 	}
-	pre, _ := hooks["PreToolUse"].([]any)
-	var kept []any
-	for _, group := range pre {
-		if !isOurEntry(group) {
-			kept = append(kept, group)
+	removed := false
+	for _, ev := range hookEvents {
+		existing, _ := hooks[ev.event].([]any)
+		var kept []any
+		for _, group := range existing {
+			if !isOurEntry(group) {
+				kept = append(kept, group)
+			}
+		}
+		if len(kept) == len(existing) {
+			continue // nothing of ours on this event
+		}
+		removed = true
+		if len(kept) == 0 {
+			delete(hooks, ev.event)
+		} else {
+			hooks[ev.event] = kept
 		}
 	}
-	if len(kept) == len(pre) {
-		return false, nil // nothing of ours was there
-	}
-	if len(kept) == 0 {
-		delete(hooks, "PreToolUse")
-	} else {
-		hooks["PreToolUse"] = kept
+	if !removed {
+		return false, nil
 	}
 	if len(hooks) == 0 {
 		delete(settings, "hooks")
 	} else {
 		settings["hooks"] = hooks
 	}
+	forgetInstall(path)
 	return true, writeSettings(path, settings)
+}
+
+// --- install tracking + restore-on-quit ---
+//
+// Every settings.json we add a hook to is recorded in ~/.omni/installs.json, so
+// terminating the dashboard can put every one of those files back the way it was
+// — remove our hook entry and delete the .omni-backup — even for a project that
+// has no live session right now. This is what makes quitting leave no trace.
+
+func installsPath() string {
+	home, _ := os.UserHomeDir()
+	return filepath.Join(home, ".omni", "installs.json")
+}
+
+func trackedInstalls() []string {
+	data, err := os.ReadFile(installsPath())
+	if err != nil {
+		return nil
+	}
+	var paths []string
+	if json.Unmarshal(data, &paths) != nil {
+		return nil
+	}
+	return paths
+}
+
+func saveInstalls(paths []string) {
+	_ = os.MkdirAll(filepath.Dir(installsPath()), 0o755)
+	data, err := json.MarshalIndent(paths, "", "  ")
+	if err != nil {
+		return
+	}
+	_ = os.WriteFile(installsPath(), data, 0o644)
+}
+
+func recordInstall(path string) {
+	for _, p := range trackedInstalls() {
+		if p == path {
+			return
+		}
+	}
+	saveInstalls(append(trackedInstalls(), path))
+}
+
+func forgetInstall(path string) {
+	var kept []string
+	for _, p := range trackedInstalls() {
+		if p != path {
+			kept = append(kept, p)
+		}
+	}
+	saveInstalls(kept)
+}
+
+// RestoreAllOnQuit removes every Omni hook entry we installed and deletes our
+// settings backups, so terminating the dashboard restores settings.json to what
+// it was before Omni. It covers every recorded install plus the global file and
+// the given live-session projects as a safety net, and only ever removes our own
+// entry — any other hooks the user has are left untouched. Returns the number of
+// settings files it changed.
+func RestoreAllOnQuit(projectDirs []string) int {
+	seen := map[string]bool{}
+	var paths []string
+	add := func(p string) {
+		if p == "" || seen[p] {
+			return
+		}
+		seen[p] = true
+		paths = append(paths, p)
+	}
+	add(settingsPath())
+	for _, p := range trackedInstalls() {
+		add(p)
+	}
+	for _, d := range projectDirs {
+		if d != "" {
+			add(projectSettingsPath(d))
+		}
+	}
+
+	n := 0
+	for _, p := range paths {
+		if changed, err := uninstallHookAt(p); err == nil && changed {
+			n++
+		}
+		_ = os.Remove(p + ".omni-backup") // drop our backup — nothing of ours left
+	}
+	saveInstalls(nil) // tracker is now empty
+	return n
 }
 
 func isOurEntry(group any) bool {
@@ -188,16 +313,31 @@ func containsSelf(cmd string) bool {
 
 // --- status queries ---
 
+// hookInstalledAt reports whether BOTH our hooks are registered. It's all-or-
+// nothing on purpose: with only PreToolUse present the permission gate works but
+// prompts queued from the dashboard would never be delivered, so reporting that
+// as "installed" would hide a broken send path.
 func hookInstalledAt(path string) bool {
 	settings := readSettings(path)
 	hooks, _ := settings["hooks"].(map[string]any)
-	pre, _ := hooks["PreToolUse"].([]any)
-	for _, g := range pre {
-		if isOurEntry(g) {
-			return true
+	for _, ev := range hookEvents {
+		found := false
+		for _, g := range asSlice(hooks[ev.event]) {
+			if isOurEntry(g) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false
 		}
 	}
-	return false
+	return true
+}
+
+func asSlice(v any) []any {
+	s, _ := v.([]any)
+	return s
 }
 
 // GlobalHookInstalled reports whether the hook is in ~/.claude/settings.json.

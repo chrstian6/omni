@@ -46,15 +46,19 @@ type Model struct {
 	mode   mode
 
 	// sessions
-	sessions   []Session
-	ended      []SavedSession // saved sessions no longer live
-	surfaces   map[string]string
-	sessCursor int
-	activity   Activity
-	activityID string
-	activityOK bool
-	convo      []convoTurn // full conversation of the selected session
-	convoID    string
+	sessions []Session
+	ended    []SavedSession // saved sessions no longer live
+	surfaces map[string]string
+	// outboxQueue is what's waiting to be delivered, per session, refreshed on
+	// the sessions tick. The view reads it on every frame — including spinner
+	// frames — so it must not hit the filesystem.
+	outboxQueue map[string][]OutboxMsg
+	sessCursor  int
+	activity    Activity
+	activityID  string
+	activityOK  bool
+	convo       []convoTurn // full conversation of the selected session
+	convoID     string
 
 	// layout / scrolling
 	listOffset int  // sidebar scroll
@@ -105,10 +109,16 @@ type Model struct {
 	// sent-prompt history for up/down recall in the compose box
 	promptHistory []string
 	histIdx       int
+	draft         string // text kept when compose is cancelled, restored on reopen
 
 	// choice selector: options the model offered, navigable with up/down
 	choices      []choiceOpt
 	choiceCursor int
+	// answeredChoices fingerprints the menu the user just answered. Delivery is
+	// asynchronous, so the transcript still shows that menu for a while after the
+	// pick — without this the selector reappears immediately and a second press
+	// queues a duplicate answer.
+	answeredChoices string
 
 	// per-session message queue. Sends are serialized (one --resume at a time)
 	// so two headless prompts never collide on the same transcript. Claude itself
@@ -202,16 +212,17 @@ func NewModel() Model {
 	nd.Placeholder = "~/path/to/project"
 
 	return Model{
-		cfg:       LoadConfig(),
-		policy:    loadPolicy(),
-		surfaces:  map[string]string{},
-		idleIdx:   1,
-		textarea:  ta,
-		rename:    ti,
-		newDir:    nd,
-		agentForm: newAgentForm(),
-		skillForm: newSkillForm(),
-		queue:     map[string][]string{},
+		cfg:         LoadConfig(),
+		policy:      loadPolicy(),
+		surfaces:    map[string]string{},
+		outboxQueue: map[string][]OutboxMsg{},
+		idleIdx:     1,
+		textarea:    ta,
+		rename:      ti,
+		newDir:      nd,
+		agentForm:   newAgentForm(),
+		skillForm:   newSkillForm(),
+		queue:       map[string][]string{},
 	}
 }
 
@@ -330,9 +341,24 @@ type sessRow struct {
 	saved SavedSession
 }
 
+// rows lists live sessions first, then ended ones. Live sessions are clustered
+// by the surface that owns them (all the VS Code ones together, then Cursor,
+// then a plain shell) because ownership is the organizing idea of the dashboard:
+// a session belongs to the terminal it was started in, and that's where its
+// prompts get delivered. Ordering within a cluster is by start time so rows stay
+// put as sessions flip between busy and waiting.
 func (m Model) rows() []sessRow {
 	rows := make([]sessRow, 0, len(m.sessions)+len(m.ended))
-	for _, s := range m.sessions {
+	live := make([]Session, len(m.sessions))
+	copy(live, m.sessions)
+	sort.SliceStable(live, func(i, j int) bool {
+		si, sj := m.surfaceOf(live[i]), m.surfaceOf(live[j])
+		if si != sj {
+			return si < sj
+		}
+		return live[i].StartedAt < live[j].StartedAt
+	})
+	for _, s := range live {
 		rows = append(rows, sessRow{s: s, live: true})
 	}
 	for _, sv := range m.ended {
@@ -499,6 +525,87 @@ func (m Model) liveSession(id string) (Session, bool) {
 	return Session{}, false
 }
 
+// deliverPrompt routes a prompt to the right mechanism for its target, and is
+// the one place that decides who owns a session.
+//
+// A LIVE session belongs to the terminal that started it. We never spawn a
+// second `claude --resume` against it — that would put two writers on one
+// transcript and leave the user's own VS Code window showing a conversation
+// that no longer matches disk. Instead the message goes to the outbox and the
+// Stop hook running inside that session hands it over on its next turn. The
+// reply appears where the user is actually looking.
+//
+// An ENDED session has no owning process, so there's nothing to diverge from
+// and `--resume` is the correct — and only — way to continue it.
+func (m *Model) deliverPrompt(r sessRow, text string) tea.Cmd {
+	if !r.live {
+		m.enqueue(r.s.SessionID, text)
+		if m.sendConn != "" {
+			m.setStatus("queued ("+itoa(m.queueLen(r.s.SessionID))+" waiting)", false)
+			return nil
+		}
+		m2, cmd := m.startNextSend()
+		*m = m2
+		return cmd
+	}
+
+	// If the session lives in a tmux pane we can type into it directly, which
+	// works whether it's busy or sitting idle at its prompt — the outbox can
+	// only ever be drained at the end of a turn, so an idle session would
+	// otherwise never receive this.
+	if pane, ok := PaneForSession(r.s); ok {
+		if err := TmuxSendLine(pane, text); err != nil {
+			m.setStatus("tmux send failed: "+err.Error(), true)
+			return nil
+		}
+		m.setStatus("typed into "+r.s.Project()+" ("+pane+")", false)
+		return nil
+	}
+
+	// Without the Stop hook in this project's settings nothing will ever drain
+	// the outbox, so say so rather than queue into a void.
+	if !m.deliveryInstalledFor(r.s.Cwd) {
+		m.setStatus("can't deliver: Omni's Stop hook isn't installed for "+r.s.Project()+" — press h to install", true)
+		return nil
+	}
+
+	if _, err := enqueueOutbox(r.s.SessionID, text); err != nil {
+		m.setStatus("could not queue: "+err.Error(), true)
+		return nil
+	}
+	m.refreshOutboxQueue() // show the badge now, not on the next tick
+
+	surface := m.surfaceOf(r.s)
+	n := len(m.outboxQueue[r.s.SessionID])
+	if r.s.IsBusy() {
+		m.setStatus("queued for "+surface+" — delivers when this turn ends ("+itoa(n)+" waiting)", false)
+	} else {
+		// Honest about the one real limitation: Stop only fires at the end of a
+		// turn, so an idle session picks this up when it next runs.
+		m.setStatus("queued for "+surface+" — delivers on its next turn ("+itoa(n)+" waiting) · f to focus", false)
+	}
+	return nil
+}
+
+// deliveryInstalledFor reports whether the hooks are registered somewhere that
+// covers this session — its own project settings, or the global file.
+func (m Model) deliveryInstalledFor(cwd string) bool {
+	return GlobalHookInstalled() || (cwd != "" && ProjectHookInstalled(cwd))
+}
+
+// refreshOutboxQueue re-reads what's queued for every live session. Called on
+// the sessions tick and right after queueing, so the badge and the pending list
+// update immediately rather than waiting for the next poll.
+func (m *Model) refreshOutboxQueue() {
+	q := make(map[string][]OutboxMsg, len(m.sessions))
+	for _, s := range m.sessions {
+		if msgs := loadOutbox(s.SessionID); len(msgs) > 0 {
+			q[s.SessionID] = msgs
+		}
+	}
+	m.outboxQueue = q
+}
+
 // enqueue adds a prompt to a session's queue.
 func (m *Model) enqueue(sessionID, text string) {
 	if m.queue == nil {
@@ -509,6 +616,22 @@ func (m *Model) enqueue(sessionID, text string) {
 
 // queueLen is how many prompts are waiting for a session.
 func (m Model) queueLen(sessionID string) int { return len(m.queue[sessionID]) }
+
+// resumableSession finds the session a queued `--resume` prompt targets. It
+// looks at ended sessions too: those are exactly the ones this path serves now
+// that live sessions are delivered through their owning terminal instead.
+// Without the ended lookup a queued prompt would find no session and be dropped.
+func (m Model) resumableSession(id string) (Session, bool) {
+	if s, ok := m.liveSession(id); ok {
+		return s, true
+	}
+	for _, sv := range m.ended {
+		if sv.SessionID == id {
+			return sv.asSession(), true
+		}
+	}
+	return Session{}, false
+}
 
 // startNextSend pops the next queued prompt for a session and sends it, but only
 // when nothing is already in flight — sends stay strictly serial so two headless
@@ -530,9 +653,9 @@ func (m Model) startNextSend() (Model, tea.Cmd) {
 		if len(q) == 0 {
 			continue
 		}
-		s, ok := m.liveSession(id)
+		s, ok := m.resumableSession(id)
 		if !ok {
-			delete(m.queue, id) // session gone — drop its queue
+			delete(m.queue, id) // session gone entirely — drop its queue
 			continue
 		}
 		next := q[0]
@@ -697,4 +820,31 @@ func (m Model) surfaceOf(s Session) string {
 func (m *Model) setStatus(s string, isErr bool) {
 	m.status = s
 	m.statusErr = isErr
+}
+
+// quitCleanup restores every settings.json Omni touched and drops the heartbeat,
+// so terminating the dashboard leaves the machine's session settings exactly as
+// they were before Omni started routing permissions.
+func (m *Model) quitCleanup() {
+	var dirs []string
+	for _, s := range m.sessions {
+		dirs = append(dirs, s.Cwd)
+	}
+	RestoreAllOnQuit(dirs)
+	removeHeartbeat()
+}
+
+// beginCompose opens the prompt bar, restoring whatever draft was left behind by
+// a previous cancel so an interrupted message isn't lost. Returns the focus cmd.
+func (m *Model) beginCompose() tea.Cmd {
+	m.mode = modeCompose
+	m.status = ""
+	m.lastReply = ""
+	if m.draft != "" {
+		m.textarea.SetValue(m.draft)
+		m.textarea.CursorEnd()
+	} else {
+		m.textarea.Reset()
+	}
+	return m.textarea.Focus()
 }
